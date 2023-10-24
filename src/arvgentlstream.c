@@ -313,9 +313,11 @@ _gentl_buffer_to_arv_buffer(ArvGenTLModule *gentl, DS_HANDLE datastream, BUFFER_
 	arv_buffer->priv->status = ARV_BUFFER_STATUS_SUCCESS;
 }
 
-static void
-_loop (ArvGenTLStreamThreadData *thread_data)
+static void *
+arv_gentl_stream_acquisition_thread (void *data)
 {
+	ArvGenTLStreamThreadData *thread_data = data;
+
 	ArvGenTLStreamPrivate *priv = arv_gentl_stream_get_instance_private (ARV_GENTL_STREAM (thread_data->stream));
 	ArvGenTLSystem *gentl_system = arv_gentl_device_get_system(priv->gentl_device);
 	ArvGenTLModule *gentl = arv_gentl_system_get_gentl(gentl_system);
@@ -329,11 +331,10 @@ _loop (ArvGenTLStreamThreadData *thread_data)
 	g_cond_signal (&thread_data->thread_started_cond);
 	g_mutex_unlock (&thread_data->thread_started_mutex);
 
- 
 	error = gentl->GCRegisterEvent(priv->stream_handle, EVENT_NEW_BUFFER, &priv->event_handle);
 	if (error != GC_ERR_SUCCESS) {
 		arv_warning_stream("GCRegisterEvent[NEW_BUFFER]: %d\n", error);
-		g_cancellable_cancel(thread_data->cancellable);
+		return NULL;
 	}
 
 	do {
@@ -341,10 +342,11 @@ _loop (ArvGenTLStreamThreadData *thread_data)
 		size_t size = sizeof(EVENT_NEW_BUFFER_DATA);
 		error = gentl->EventGetData(priv->event_handle, &NewImageEventData, &size, GENTL_INFINITE);
 		if (error != GC_ERR_SUCCESS) {
-			arv_warning_stream("EventGetData[NEW_BUFFER]: %d\n", error);
+			if (error != GC_ERR_ABORT)
+				arv_warning_stream("EventGetData[NEW_BUFFER]: %d\n", error);
 			break;
 		}
-		printf("Got new buffer\n");
+		printf("\n========== Got new buffer ==========\n\n");
 		gentl_buffer = NewImageEventData.BufferHandle;
 
 		arv_buffer = arv_stream_pop_input_buffer (thread_data->stream);
@@ -375,70 +377,16 @@ _loop (ArvGenTLStreamThreadData *thread_data)
 		gentl->DSQueueBuffer(priv->stream_handle, gentl_buffer);
 	} while (!g_cancellable_is_cancelled (thread_data->cancellable));
 
-	gentl->GCUnregisterEvent(priv->event_handle, EVENT_NEW_BUFFER);
-}
+	error = gentl->GCUnregisterEvent(priv->stream_handle, EVENT_NEW_BUFFER);
+	if (error != GC_ERR_SUCCESS)
+		arv_warning_stream("GCUnregisterEvent[%p]: %d\n", priv->event_handle, error);
 
-static void *
-arv_gentl_stream_acquisition_thread (void *data)
-{
-	ArvGenTLStreamThreadData *thread_data = data;
-
-	if (thread_data->callback != NULL)
-		thread_data->callback (thread_data->callback_data, ARV_STREAM_CALLBACK_TYPE_INIT, NULL);
-
-	_loop (thread_data);
-
-	if (thread_data->callback != NULL)
-		thread_data->callback (thread_data->callback_data, ARV_STREAM_CALLBACK_TYPE_EXIT, NULL);
+	priv->event_handle = NULL;
 
 	return NULL;
 }
 
 /* ArvGenTLStream implementation */
-
-static void
-arv_gentl_stream_start_acquisition_thread (ArvGenTLStream *gentl_stream)
-{
-	ArvGenTLStreamPrivate *priv = arv_gentl_stream_get_instance_private (gentl_stream);
-	ArvGenTLStreamThreadData *thread_data;
-
-	g_return_if_fail (priv->thread == NULL);
-	g_return_if_fail (priv->thread_data != NULL);
-
-	thread_data = priv->thread_data;
-
-	thread_data->gentl_device = priv->gentl_device;
-	thread_data->thread_started = FALSE;
-	thread_data->cancellable = g_cancellable_new ();
-	priv->thread = g_thread_new ("arv_gentl_stream", arv_gentl_stream_acquisition_thread, priv->thread_data);
-
-	g_mutex_lock (&thread_data->thread_started_mutex);
-	while (!thread_data->thread_started)
-		g_cond_wait (&thread_data->thread_started_cond,
-				&thread_data->thread_started_mutex);
-	g_mutex_unlock (&thread_data->thread_started_mutex);
-}
-
-static void
-arv_gentl_stream_stop_acquisition_thread (ArvGenTLStream *gentl_stream)
-{
-	ArvGenTLStreamPrivate *priv = arv_gentl_stream_get_instance_private (gentl_stream);
-	ArvGenTLSystem *gentl_system = arv_gentl_device_get_system(priv->gentl_device);
-	ArvGenTLModule *gentl = arv_gentl_system_get_gentl(gentl_system);
-	ArvGenTLStreamThreadData *thread_data;
-
-	g_return_if_fail (priv->thread != NULL);
-	g_return_if_fail (priv->thread_data != NULL);
-
-	thread_data = priv->thread_data;
-
-	g_cancellable_cancel (thread_data->cancellable);
-	gentl->EventKill(priv->event_handle);
-	g_thread_join (priv->thread);
-	g_clear_object (&thread_data->cancellable);
-
-	priv->thread = NULL;
-}
 
 void
 arv_gentl_stream_start_acquisition (ArvGenTLStream *gentl_stream)
@@ -450,9 +398,25 @@ arv_gentl_stream_start_acquisition (ArvGenTLStream *gentl_stream)
 	BUFFER_HANDLE gentl_buffer;
 	size_t payload_size;
 	GC_ERROR error;
+	ArvGenTLStreamThreadData *thread_data;
 
-	if (priv->thread != NULL)
-		return;
+	g_return_if_fail (priv->stream_handle != NULL);
+	g_return_if_fail (priv->thread == NULL);
+	g_return_if_fail (priv->thread_data != NULL);
+
+	/* Start acquisition thread */
+	thread_data = priv->thread_data;
+
+	thread_data->gentl_device = priv->gentl_device;
+	thread_data->thread_started = FALSE;
+	thread_data->cancellable = g_cancellable_new ();
+	priv->thread = g_thread_new ("arv_gentl_stream_acquisition", arv_gentl_stream_acquisition_thread, priv->thread_data);
+
+	g_mutex_lock (&thread_data->thread_started_mutex);
+	while (!thread_data->thread_started)
+		g_cond_wait (&thread_data->thread_started_cond,
+				&thread_data->thread_started_mutex);
+	g_mutex_unlock (&thread_data->thread_started_mutex);
 
 	/* Get payload size from an input buffer */
 	arv_buffer = arv_stream_pop_input_buffer (ARV_STREAM(gentl_stream));
@@ -476,9 +440,7 @@ arv_gentl_stream_start_acquisition (ArvGenTLStream *gentl_stream)
 			break;
 		}
 	}
-	arv_gentl_stream_start_acquisition_thread(gentl_stream);
 
-	printf("stream_start\n");
 	/* Start acquisition */
 	error = gentl->DSStartAcquisition(priv->stream_handle, ACQ_START_FLAGS_DEFAULT, GENTL_INFINITE);
 	if (error != GC_ERR_SUCCESS) {
@@ -493,18 +455,27 @@ arv_gentl_stream_stop_acquisition(ArvGenTLStream *gentl_stream)
 	ArvGenTLSystem *gentl_system = arv_gentl_device_get_system(priv->gentl_device);
 	ArvGenTLModule *gentl = arv_gentl_system_get_gentl(gentl_system);
 	GC_ERROR error;
+	ArvGenTLStreamThreadData *thread_data;
 
 	if (priv->thread == NULL)
 		return;
 
-	arv_gentl_stream_stop_acquisition_thread(gentl_stream);
+	g_return_if_fail (priv->stream_handle != NULL);
+	g_return_if_fail (priv->thread_data != NULL);
 
+	/* Join acquisition thread */
+	thread_data = priv->thread_data;
+
+	g_cancellable_cancel (thread_data->cancellable);
 	error = gentl->EventKill(priv->event_handle);
 	if (error != GC_ERR_SUCCESS)
 		arv_warning_stream("EventKill: %d", error);
+	g_thread_join (priv->thread);
+	priv->thread = NULL;
+	g_clear_object (&thread_data->cancellable);
 
 	error = gentl->DSStopAcquisition(priv->stream_handle, ACQ_STOP_FLAGS_DEFAULT);
-	if (error != GC_ERR_SUCCESS && error != GC_ERR_RESOURCE_IN_USE)
+	if (error != GC_ERR_SUCCESS)
 		arv_warning_stream("DSStopAcquisition: %d", error);
 
 	error = gentl->DSFlushQueue(priv->stream_handle, ACQ_QUEUE_ALL_DISCARD);
@@ -518,8 +489,6 @@ arv_gentl_stream_stop_acquisition(ArvGenTLStream *gentl_stream)
 			break;
 		gentl->DSRevokeBuffer(priv->stream_handle, gentl_buffer, NULL, NULL);
 	} while (1);
-
-	printf("stream_stop\n");
 }
 
 /**
@@ -547,13 +516,19 @@ arv_gentl_stream_new (ArvGenTLDevice *gentl_device, ArvStreamCallback callback, 
 static void
 arv_gentl_stream_start_thread (ArvStream *stream)
 {
+	ArvGenTLStreamPrivate *priv = arv_gentl_stream_get_instance_private ( ARV_GENTL_STREAM(stream) );
 
+	if (priv->thread_data->callback != NULL)
+		priv->thread_data->callback (priv->thread_data->callback_data, ARV_STREAM_CALLBACK_TYPE_INIT, NULL);
 }
 
 static void
 arv_gentl_stream_stop_thread (ArvStream *stream)
 {
+	ArvGenTLStreamPrivate *priv = arv_gentl_stream_get_instance_private ( ARV_GENTL_STREAM(stream) );
 
+	if (priv->thread_data->callback != NULL)
+		priv->thread_data->callback (priv->thread_data->callback_data, ARV_STREAM_CALLBACK_TYPE_EXIT, NULL);
 }
 
 static void
@@ -650,12 +625,7 @@ arv_gentl_stream_finalize (GObject *object)
 		arv_warning_stream ("DSClose: %d", error);
 	}
 
-	if (priv->thread_data != NULL) {
-		ArvGenTLStreamThreadData *thread_data;
-
-		thread_data = priv->thread_data;
-		g_clear_pointer (&thread_data, g_free);
-	}
+	g_clear_pointer (&priv->thread_data, g_free);
 
 	g_clear_object (&priv->gentl_device);
 

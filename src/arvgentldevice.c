@@ -133,8 +133,6 @@ arv_gentl_device_start_acquisition(ArvGenTLDevice *gentl_device)
 {
 	ArvGenTLDevicePrivate *priv = arv_gentl_device_get_instance_private (gentl_device);
 
-	printf("device_start %d\n", g_list_length(priv->gentl_streams));
-
 	/* Iterate over all created GenTL streams */
 	GList *gentl_streams_iter = priv->gentl_streams;
 	while (gentl_streams_iter != NULL) {
@@ -142,11 +140,10 @@ arv_gentl_device_start_acquisition(ArvGenTLDevice *gentl_device)
 		ArvGenTLStream *stream = g_weak_ref_get(stream_weak_ref);
 		if (stream) {
 			arv_gentl_stream_start_acquisition(stream);
+			g_object_unref(stream);
 		} else {
 			GList *prev = gentl_streams_iter->prev;
-			priv->gentl_streams = g_list_remove_link(priv->gentl_streams, gentl_streams_iter);
-			g_weak_ref_clear(gentl_streams_iter->data);
-			g_free(gentl_streams_iter->data);
+			priv->gentl_streams = g_list_delete_link(priv->gentl_streams, gentl_streams_iter);
 			gentl_streams_iter = prev ? prev : priv->gentl_streams;
 		}
 		gentl_streams_iter = g_list_next(gentl_streams_iter);
@@ -158,8 +155,6 @@ arv_gentl_device_stop_acquisition(ArvGenTLDevice *gentl_device)
 {
 	ArvGenTLDevicePrivate *priv = arv_gentl_device_get_instance_private (gentl_device);
 
-	printf("device_stop %d\n", g_list_length(priv->gentl_streams));
-
 	/* Iterate over all created GenTL streams */
 	GList *gentl_streams_iter = priv->gentl_streams;
 	while (gentl_streams_iter != NULL) {
@@ -167,11 +162,10 @@ arv_gentl_device_stop_acquisition(ArvGenTLDevice *gentl_device)
 		ArvGenTLStream *stream = g_weak_ref_get(stream_weak_ref);
 		if (stream) {
 			arv_gentl_stream_stop_acquisition(stream);
+			g_object_unref(stream);
 		} else {
 			GList *prev = gentl_streams_iter->prev;
-			priv->gentl_streams = g_list_remove_link(priv->gentl_streams, gentl_streams_iter);
-			g_weak_ref_clear(gentl_streams_iter->data);
-			g_free(gentl_streams_iter->data);
+			priv->gentl_streams = g_list_delete_link(priv->gentl_streams, gentl_streams_iter);
 			gentl_streams_iter = prev ? prev : priv->gentl_streams;
 		}
 		gentl_streams_iter = g_list_next(gentl_streams_iter);
@@ -286,6 +280,10 @@ arv_gentl_device_finalize (GObject *object)
 	ArvGenTLDevicePrivate *priv = arv_gentl_device_get_instance_private (ARV_GENTL_DEVICE (object));
 
 	arv_gentl_system_close_device_handle(priv->gentl_system, priv->interface_id, priv->device_handle);
+
+	for (GList *iter=priv->gentl_streams; iter; iter=g_list_next(iter))
+		g_weak_ref_clear(iter->data);
+	g_list_free(priv->gentl_streams);
 
 	g_clear_object (&priv->genicam);
 	g_clear_pointer (&priv->genicam_xml, g_free);

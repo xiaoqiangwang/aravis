@@ -808,7 +808,7 @@ arv_camera_start_acquisition (ArvCamera *camera, GError **error)
 	ArvCameraPrivate *priv = arv_camera_get_instance_private (camera);
 
 	if (arv_camera_is_gentl_device(camera))
-		return arv_gentl_device_start_acquisition (ARV_GENTL_DEVICE (priv->device));
+		arv_gentl_device_start_acquisition (ARV_GENTL_DEVICE (priv->device));
 
 	arv_camera_execute_command (camera, "AcquisitionStart", error);
 }
@@ -831,7 +831,7 @@ arv_camera_stop_acquisition (ArvCamera *camera, GError **error)
 	arv_camera_execute_command (camera, "AcquisitionStop", error);
 
 	if (arv_camera_is_gentl_device(camera))
-		return arv_gentl_device_stop_acquisition (ARV_GENTL_DEVICE (priv->device));
+		arv_gentl_device_stop_acquisition (ARV_GENTL_DEVICE (priv->device));
 }
 
 /**
