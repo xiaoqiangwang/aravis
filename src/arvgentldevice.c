@@ -56,6 +56,8 @@ typedef struct {
 	ArvGenTLSystem *gentl_system;
 	void *device_handle;
 	void *port_handle;
+
+	GList *gentl_streams;
 } ArvGenTLDevicePrivate;
 
 struct _ArvGenTLDevice {
@@ -114,6 +116,8 @@ arv_gentl_device_open_stream_handle(ArvGenTLDevice *device)
 		return NULL;
 	}
 
+	arv_info_device("Open Stream '%s'", stream_id);
+
 	return stream_handle;
 }
 
@@ -122,6 +126,56 @@ arv_gentl_device_get_system(ArvGenTLDevice *device)
 {
 	ArvGenTLDevicePrivate *priv = arv_gentl_device_get_instance_private (device);
 	return priv->gentl_system;
+}
+
+void
+arv_gentl_device_start_acquisition(ArvGenTLDevice *gentl_device)
+{
+	ArvGenTLDevicePrivate *priv = arv_gentl_device_get_instance_private (gentl_device);
+
+	printf("device_start %d\n", g_list_length(priv->gentl_streams));
+
+	/* Iterate over all created GenTL streams */
+	GList *gentl_streams_iter = priv->gentl_streams;
+	while (gentl_streams_iter != NULL) {
+		GWeakRef *stream_weak_ref = gentl_streams_iter->data;
+		ArvGenTLStream *stream = g_weak_ref_get(stream_weak_ref);
+		if (stream) {
+			arv_gentl_stream_start_acquisition(stream);
+		} else {
+			GList *prev = gentl_streams_iter->prev;
+			priv->gentl_streams = g_list_remove_link(priv->gentl_streams, gentl_streams_iter);
+			g_weak_ref_clear(gentl_streams_iter->data);
+			g_free(gentl_streams_iter->data);
+			gentl_streams_iter = prev ? prev : priv->gentl_streams;
+		}
+		gentl_streams_iter = g_list_next(gentl_streams_iter);
+	}
+}
+
+void
+arv_gentl_device_stop_acquisition(ArvGenTLDevice *gentl_device)
+{
+	ArvGenTLDevicePrivate *priv = arv_gentl_device_get_instance_private (gentl_device);
+
+	printf("device_stop %d\n", g_list_length(priv->gentl_streams));
+
+	/* Iterate over all created GenTL streams */
+	GList *gentl_streams_iter = priv->gentl_streams;
+	while (gentl_streams_iter != NULL) {
+		GWeakRef *stream_weak_ref = gentl_streams_iter->data;
+		ArvGenTLStream *stream = g_weak_ref_get(stream_weak_ref);
+		if (stream) {
+			arv_gentl_stream_stop_acquisition(stream);
+		} else {
+			GList *prev = gentl_streams_iter->prev;
+			priv->gentl_streams = g_list_remove_link(priv->gentl_streams, gentl_streams_iter);
+			g_weak_ref_clear(gentl_streams_iter->data);
+			g_free(gentl_streams_iter->data);
+			gentl_streams_iter = prev ? prev : priv->gentl_streams;
+		}
+		gentl_streams_iter = g_list_next(gentl_streams_iter);
+	}
 }
 
 /* ArvGenTLDevice implemenation */
@@ -142,11 +196,17 @@ static ArvStream *
 arv_gentl_device_create_stream (ArvDevice *device, ArvStreamCallback callback, void *user_data, GDestroyNotify destroy, GError **error)
 {
 	ArvGenTLDevice *gentl_device = ARV_GENTL_DEVICE (device);
+	ArvGenTLDevicePrivate *priv = arv_gentl_device_get_instance_private (gentl_device);
 	ArvStream *stream;
+	GWeakRef *stream_weak_ref;
 
 	stream = arv_gentl_stream_new (gentl_device, callback, user_data, destroy, error);
 	if (!ARV_IS_STREAM (stream))
 		return NULL;
+
+	stream_weak_ref = g_new(GWeakRef, 1);
+	g_weak_ref_init(stream_weak_ref, ARV_GENTL_STREAM(stream));
+	priv->gentl_streams = g_list_append(priv->gentl_streams, stream_weak_ref);
 
 	return stream;
 }
@@ -217,6 +277,7 @@ arv_gentl_device_init (ArvGenTLDevice *gentl_device)
 	priv->interface_id = NULL;
 	priv->device_id = NULL;
 	priv->port_handle = NULL;
+	priv->gentl_streams = NULL;
 }
 
 static void

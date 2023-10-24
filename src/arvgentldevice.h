@@ -39,6 +39,9 @@ ARV_API G_DECLARE_FINAL_TYPE (ArvGenTLDevice, arv_gentl_device, ARV, GENTL_DEVIC
 
 ARV_API ArvDevice *	arv_gentl_device_new 	(ArvGenTLSystem *gentl_system, const char *interface_id, const char *device_id, GError **error);
 
+void arv_gentl_device_start_acquisition(ArvGenTLDevice *gentl_device);
+void arv_gentl_device_stop_acquisition(ArvGenTLDevice *gentl_device);
+
 G_END_DECLS
 
 #endif

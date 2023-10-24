@@ -342,9 +342,9 @@ _loop (ArvGenTLStreamThreadData *thread_data)
 		error = gentl->EventGetData(priv->event_handle, &NewImageEventData, &size, GENTL_INFINITE);
 		if (error != GC_ERR_SUCCESS) {
 			arv_warning_stream("EventGetData[NEW_BUFFER]: %d\n", error);
-			continue;
+			break;
 		}
-
+		printf("Got new buffer\n");
 		gentl_buffer = NewImageEventData.BufferHandle;
 
 		arv_buffer = arv_stream_pop_input_buffer (thread_data->stream);
@@ -379,7 +379,7 @@ _loop (ArvGenTLStreamThreadData *thread_data)
 }
 
 static void *
-arv_gentl_stream_thread (void *data)
+arv_gentl_stream_acquisition_thread (void *data)
 {
 	ArvGenTLStreamThreadData *thread_data = data;
 
@@ -397,9 +397,9 @@ arv_gentl_stream_thread (void *data)
 /* ArvGenTLStream implementation */
 
 static void
-arv_gentl_stream_start_thread (ArvStream *stream)
+arv_gentl_stream_start_acquisition_thread (ArvGenTLStream *gentl_stream)
 {
-	ArvGenTLStreamPrivate *priv = arv_gentl_stream_get_instance_private (ARV_GENTL_STREAM (stream));
+	ArvGenTLStreamPrivate *priv = arv_gentl_stream_get_instance_private (gentl_stream);
 	ArvGenTLStreamThreadData *thread_data;
 
 	g_return_if_fail (priv->thread == NULL);
@@ -410,7 +410,7 @@ arv_gentl_stream_start_thread (ArvStream *stream)
 	thread_data->gentl_device = priv->gentl_device;
 	thread_data->thread_started = FALSE;
 	thread_data->cancellable = g_cancellable_new ();
-	priv->thread = g_thread_new ("arv_gentl_stream", arv_gentl_stream_thread, priv->thread_data);
+	priv->thread = g_thread_new ("arv_gentl_stream", arv_gentl_stream_acquisition_thread, priv->thread_data);
 
 	g_mutex_lock (&thread_data->thread_started_mutex);
 	while (!thread_data->thread_started)
@@ -420,9 +420,9 @@ arv_gentl_stream_start_thread (ArvStream *stream)
 }
 
 static void
-arv_gentl_stream_stop_thread (ArvStream *stream)
+arv_gentl_stream_stop_acquisition_thread (ArvGenTLStream *gentl_stream)
 {
-	ArvGenTLStreamPrivate *priv = arv_gentl_stream_get_instance_private (ARV_GENTL_STREAM (stream));
+	ArvGenTLStreamPrivate *priv = arv_gentl_stream_get_instance_private (gentl_stream);
 	ArvGenTLSystem *gentl_system = arv_gentl_device_get_system(priv->gentl_device);
 	ArvGenTLModule *gentl = arv_gentl_system_get_gentl(gentl_system);
 	ArvGenTLStreamThreadData *thread_data;
@@ -440,10 +440,10 @@ arv_gentl_stream_stop_thread (ArvStream *stream)
 	priv->thread = NULL;
 }
 
-static void
-arv_gentl_stream_start_acquisition (ArvStream *stream)
+void
+arv_gentl_stream_start_acquisition (ArvGenTLStream *gentl_stream)
 {
-	ArvGenTLStreamPrivate *priv = arv_gentl_stream_get_instance_private (ARV_GENTL_STREAM (stream));
+	ArvGenTLStreamPrivate *priv = arv_gentl_stream_get_instance_private (gentl_stream);
 	ArvGenTLSystem *gentl_system = arv_gentl_device_get_system(priv->gentl_device);
 	ArvGenTLModule *gentl = arv_gentl_system_get_gentl(gentl_system);
 	ArvBuffer *arv_buffer;
@@ -451,14 +451,17 @@ arv_gentl_stream_start_acquisition (ArvStream *stream)
 	size_t payload_size;
 	GC_ERROR error;
 
+	if (priv->thread != NULL)
+		return;
+
 	/* Get payload size from an input buffer */
-	arv_buffer = arv_stream_pop_input_buffer (stream);
+	arv_buffer = arv_stream_pop_input_buffer (ARV_STREAM(gentl_stream));
 	if (arv_buffer == NULL) {
 		arv_warning_stream("Input buffer empty");
 		return;
 	}
 	payload_size = arv_buffer->priv->allocated_size;
-	arv_stream_push_buffer(stream, arv_buffer);
+	arv_stream_push_buffer(ARV_STREAM(gentl_stream), arv_buffer);
 
 	/* Allocate, announce and queue buffers */
 	for (guint i=0; i<priv->n_buffers; i++) {
@@ -473,7 +476,9 @@ arv_gentl_stream_start_acquisition (ArvStream *stream)
 			break;
 		}
 	}
+	arv_gentl_stream_start_acquisition_thread(gentl_stream);
 
+	printf("stream_start\n");
 	/* Start acquisition */
 	error = gentl->DSStartAcquisition(priv->stream_handle, ACQ_START_FLAGS_DEFAULT, GENTL_INFINITE);
 	if (error != GC_ERR_SUCCESS) {
@@ -481,13 +486,18 @@ arv_gentl_stream_start_acquisition (ArvStream *stream)
 	}
 }
 
-static void
-arv_gentl_stream_stop_acquisition(ArvStream *stream)
+void
+arv_gentl_stream_stop_acquisition(ArvGenTLStream *gentl_stream)
 {
-	ArvGenTLStreamPrivate *priv = arv_gentl_stream_get_instance_private (ARV_GENTL_STREAM (stream));
+	ArvGenTLStreamPrivate *priv = arv_gentl_stream_get_instance_private (gentl_stream);
 	ArvGenTLSystem *gentl_system = arv_gentl_device_get_system(priv->gentl_device);
 	ArvGenTLModule *gentl = arv_gentl_system_get_gentl(gentl_system);
 	GC_ERROR error;
+
+	if (priv->thread == NULL)
+		return;
+
+	arv_gentl_stream_stop_acquisition_thread(gentl_stream);
 
 	error = gentl->EventKill(priv->event_handle);
 	if (error != GC_ERR_SUCCESS)
@@ -508,6 +518,8 @@ arv_gentl_stream_stop_acquisition(ArvStream *stream)
 			break;
 		gentl->DSRevokeBuffer(priv->stream_handle, gentl_buffer, NULL, NULL);
 	} while (1);
+
+	printf("stream_stop\n");
 }
 
 /**
@@ -531,6 +543,18 @@ arv_gentl_stream_new (ArvGenTLDevice *gentl_device, ArvStreamCallback callback, 
 }
 
 /* ArvStream implementation */
+
+static void
+arv_gentl_stream_start_thread (ArvStream *stream)
+{
+
+}
+
+static void
+arv_gentl_stream_stop_thread (ArvStream *stream)
+{
+
+}
 
 static void
 arv_gentl_stream_init (ArvGenTLStream *gentl_stream)
@@ -614,11 +638,13 @@ arv_gentl_stream_finalize (GObject *object)
 	ArvGenTLModule *gentl = arv_gentl_system_get_gentl(gentl_system);
 	GC_ERROR error;
 
-	arv_gentl_stream_stop_acquisition (ARV_STREAM (object));
-	arv_gentl_stream_stop_thread (ARV_STREAM (object));
 
 	/* Close the data stream. */
 	arv_info_stream("Close stream");
+
+	arv_gentl_stream_stop_acquisition (ARV_GENTL_STREAM (object));
+	arv_gentl_stream_stop_thread (ARV_STREAM (object));
+
 	error = gentl->DSClose(priv->stream_handle);
 	if (error != GC_ERR_SUCCESS) {
 		arv_warning_stream ("DSClose: %d", error);
@@ -649,9 +675,6 @@ arv_gentl_stream_class_init (ArvGenTLStreamClass *gentl_stream_class)
 
 	stream_class->start_thread = arv_gentl_stream_start_thread;
 	stream_class->stop_thread = arv_gentl_stream_stop_thread;
-
-	stream_class->start_acquisition = arv_gentl_stream_start_acquisition;
-	stream_class->stop_acquisition = arv_gentl_stream_stop_acquisition;
 
 	g_object_class_install_property
 		(object_class,

@@ -37,6 +37,9 @@ G_BEGIN_DECLS
 
 ArvStream * 	arv_gentl_stream_new		(ArvGenTLDevice *gentl_device, ArvStreamCallback callback, void *callback_data, GDestroyNotify destroy, GError **error);
 
+void		arv_gentl_stream_start_acquisition	        (ArvGenTLStream *stream);
+void		arv_gentl_stream_stop_acquisition	        (ArvGenTLStream *stream);
+
 G_END_DECLS
 
 #endif
