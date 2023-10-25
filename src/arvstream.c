@@ -31,6 +31,7 @@
  */
 
 #include <arvstreamprivate.h>
+#include <arvgentlstreamprivate.h>
 #include <arvbuffer.h>
 #include <arvdevice.h>
 #include <arvdebugprivate.h>
@@ -102,7 +103,11 @@ arv_stream_push_buffer (ArvStream *stream, ArvBuffer *buffer)
 	g_return_if_fail (ARV_IS_STREAM (stream));
 	g_return_if_fail (ARV_IS_BUFFER (buffer));
 
-	g_async_queue_push (priv->input_queue, buffer);
+	if (ARV_IS_GENTL_STREAM (stream) &&
+		arv_gentl_stream_push_buffer(ARV_GENTL_STREAM(stream), buffer))
+			return;
+	else
+		g_async_queue_push (priv->input_queue, buffer);
 }
 
 /**

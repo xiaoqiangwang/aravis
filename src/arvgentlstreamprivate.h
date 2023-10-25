@@ -40,6 +40,8 @@ ArvStream * 	arv_gentl_stream_new		(ArvGenTLDevice *gentl_device, ArvStreamCallb
 void		arv_gentl_stream_start_acquisition (ArvGenTLStream *gentl_stream);
 void		arv_gentl_stream_stop_acquisition (ArvGenTLStream *gentl_stream);
 
+gboolean	arv_gentl_stream_push_buffer (ArvGenTLStream *gentl_stream, ArvBuffer *buffer);
+
 G_END_DECLS
 
 #endif

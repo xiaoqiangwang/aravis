@@ -238,7 +238,6 @@ _gentl_buffer_to_arv_buffer(ArvGenTLModule *gentl, DS_HANDLE datastream, BUFFER_
 	arv_buffer->priv->received_size = actual_size;
 
 	_gentl_buffer_info_ptr(gentl, datastream, gentl_buffer, BUFFER_INFO_BASE, &data);
-	memcpy(arv_buffer->priv->data, data, data_size);
 
 	if (payload_type == PAYLOAD_TYPE_CHUNK_ONLY) {
 		arv_buffer_set_n_parts(arv_buffer, 0);
@@ -347,8 +346,7 @@ _loop (ArvGenTLStreamThreadData *thread_data)
 		}
 
 		gentl_buffer = NewImageEventData.BufferHandle;
-
-		arv_buffer = arv_stream_pop_input_buffer (thread_data->stream);
+		arv_buffer = NewImageEventData.pUserPointer;
 		if (arv_buffer) {
 			if (thread_data->callback != NULL)
 				thread_data->callback (thread_data->callback_data,
@@ -364,6 +362,10 @@ _loop (ArvGenTLStreamThreadData *thread_data)
 
 			thread_data->n_transferred_bytes += arv_buffer->priv->allocated_size;
 
+			error = gentl->DSRevokeBuffer(priv->stream_handle, gentl_buffer, NULL, NULL);
+			if (error != GC_ERR_SUCCESS)
+				arv_warning_stream("DSRevokeBuffer: %d\n", error);
+
 			arv_stream_push_output_buffer(thread_data->stream, arv_buffer);
 			if (thread_data->callback != NULL)
 				thread_data->callback (thread_data->callback_data,
@@ -372,8 +374,6 @@ _loop (ArvGenTLStreamThreadData *thread_data)
 		} else {
 			thread_data->n_underruns += 1;
 		}
-
-		gentl->DSQueueBuffer(priv->stream_handle, gentl_buffer);
 	} while (!g_cancellable_is_cancelled (thread_data->cancellable));
 
 	error = gentl->GCUnregisterEvent(priv->stream_handle, EVENT_NEW_BUFFER);
@@ -446,39 +446,12 @@ arv_gentl_stream_stop_thread (ArvStream *stream)
 void
 arv_gentl_stream_start_acquisition (ArvGenTLStream *gentl_stream)
 {
-	ArvStream *stream = ARV_STREAM(gentl_stream);
 	ArvGenTLStreamPrivate *priv = arv_gentl_stream_get_instance_private (gentl_stream);
 	ArvGenTLSystem *gentl_system = arv_gentl_device_get_system(priv->gentl_device);
 	ArvGenTLModule *gentl = arv_gentl_system_get_gentl(gentl_system);
-	ArvBuffer *arv_buffer;
-	BUFFER_HANDLE gentl_buffer;
-	size_t payload_size;
 	GC_ERROR error;
 
 	arv_info_stream("Start acquisition");
-
-	/* Get payload size from an input buffer */
-	arv_buffer = arv_stream_pop_input_buffer (stream);
-	if (arv_buffer == NULL) {
-		arv_warning_stream("Input buffer empty");
-		return;
-	}
-	payload_size = arv_buffer->priv->allocated_size;
-	arv_stream_push_buffer( ARV_STREAM(stream), arv_buffer);
-
-	/* Allocate, announce and queue buffers */
-	for (guint i=0; i<priv->n_buffers; i++) {
-		error = gentl->DSAllocAndAnnounceBuffer(priv->stream_handle, payload_size, NULL, &gentl_buffer);
-		if (error != GC_ERR_SUCCESS) {
-			arv_warning_stream("[DSAllocaAndAnnounceBuffer]: %d", error);
-			break;
-		}
-		error = gentl->DSQueueBuffer(priv->stream_handle, gentl_buffer);
-		if (error != GC_ERR_SUCCESS) {
-			arv_warning_stream("[DSQueueBuffer]: %d", error);
-			break;
-		}
-	}
 
 	/* Start acquisition */
 	error = gentl->DSStartAcquisition(priv->stream_handle, ACQ_START_FLAGS_DEFAULT, GENTL_INFINITE);
@@ -512,6 +485,33 @@ arv_gentl_stream_stop_acquisition(ArvGenTLStream *gentl_stream)
 			break;
 		gentl->DSRevokeBuffer(priv->stream_handle, gentl_buffer, NULL, NULL);
 	} while (1);
+}
+
+gboolean
+arv_gentl_stream_push_buffer(ArvGenTLStream *gentl_stream, ArvBuffer *buffer)
+{
+	ArvGenTLStreamPrivate *priv = arv_gentl_stream_get_instance_private (gentl_stream);
+	ArvGenTLSystem *gentl_system = arv_gentl_device_get_system(priv->gentl_device);
+	ArvGenTLModule *gentl = arv_gentl_system_get_gentl(gentl_system);
+	BUFFER_HANDLE gentl_buffer = NULL;
+	GC_ERROR error;
+
+	error = gentl->DSAnnounceBuffer(priv->stream_handle,
+				buffer->priv->data, buffer->priv->allocated_size,
+				buffer,
+				&gentl_buffer);
+	if (error != GC_ERR_SUCCESS) {
+		arv_warning_stream("[DSAnnounceBuffer]: %d", error);
+		return FALSE;
+	}
+
+	error = gentl->DSQueueBuffer(priv->stream_handle, gentl_buffer);
+	if (error != GC_ERR_SUCCESS) {
+		arv_warning_stream("[DSQueueBuffer]: %d", error);
+		return FALSE;
+	}
+
+	return TRUE;
 }
 
 /**
