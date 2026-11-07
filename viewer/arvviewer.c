@@ -28,6 +28,7 @@
 #include <arv.h>
 #include <arvdebugprivate.h>
 #include <arvviewer.h>
+#include <arvfeaturetree.h>
 #include <math.h>
 #include <memory.h>
 
@@ -117,34 +118,34 @@ struct  _ArvViewer {
 	ArvGcRepresentation exposure_time_representation;
 
 	GtkWidget *main_window;
-	GtkWidget *main_stack;
+	GtkWidget *main_paned;
 	GtkWidget *main_headerbar;
 	GtkWidget *camera_box;
+	GtkWidget *camera_paned;
 	GtkWidget *refresh_button;
 	GtkWidget *video_mode_button;
 	GtkWidget *camera_tree;
-	GtkWidget *back_button;
 	GtkWidget *snapshot_button;
 	GtkWidget *rotate_cw_button;
 	GtkWidget *flip_vertical_toggle;
 	GtkWidget *flip_horizontal_toggle;
-	GtkWidget *camera_parameters;
+	GtkWidget *video_box;
+	GtkWidget *video_frame;
+	ArvViewerFeatureTree *feature_tree;
+	GtkWidget *pixel_format_combo;
 	GtkWidget *component_label;
 	GtkWidget *component_combo;
 	GtkWidget *component_check;
-	GtkWidget *pixel_format_combo;
 	GtkWidget *camera_x;
 	GtkWidget *camera_y;
-        GtkWidget *camera_position_label;
-        GtkWidget *camera_position_units;
-	GtkWidget *camera_binning_x;
-	GtkWidget *camera_binning_y;
-        GtkWidget *camera_binning_label;
-        GtkWidget *camera_binning_units;
 	GtkWidget *camera_width;
 	GtkWidget *camera_height;
-	GtkWidget *video_box;
-	GtkWidget *video_frame;
+	GtkWidget *camera_binning_x;
+	GtkWidget *camera_binning_y;
+	GtkWidget *camera_binning_label;
+	GtkWidget *camera_binning_units;
+	GtkWidget *camera_position_label;
+	GtkWidget *camera_position_units;
 	GtkWidget *fps_label;
 	GtkWidget *image_label;
 	GtkWidget *trigger_combo_box;
@@ -158,7 +159,6 @@ struct  _ArvViewer {
 	GtkWidget *black_level_spin_button;
 	GtkWidget *black_level_hscale;
         GtkWidget *auto_black_level_toggle;
-	GtkWidget *acquisition_button;
 
         GtkWidget *notification_revealer;
         GtkWidget *notification_label;
@@ -179,20 +179,23 @@ struct  _ArvViewer {
 	gulong auto_black_level_clicked;
 	gulong camera_x_changed;
 	gulong camera_y_changed;
-	gulong camera_binning_x_changed;
-	gulong camera_binning_y_changed;
 	gulong camera_width_changed;
 	gulong camera_height_changed;
+	gulong camera_binning_x_changed;
+	gulong camera_binning_y_changed;
 	gulong component_changed;
 	gulong component_toggled;
 	gulong pixel_format_changed;
-        gulong rotate_cw_clicked;
+	gulong rotate_cw_clicked;
         gulong flip_vertical_clicked;
         gulong flip_horizontal_clicked;
 
 	guint gain_update_event;
 	guint black_level_update_event;
 	guint exposure_update_event;
+
+	guint feature_refresh_event;
+	gboolean feature_change_active;
 
 	guint status_bar_update_event;
 	gint64 last_status_bar_update_time_ms;
@@ -223,12 +226,11 @@ typedef GtkApplicationClass ArvViewerClass;
 
 G_DEFINE_TYPE (ArvViewer, arv_viewer, GTK_TYPE_APPLICATION)
 
-typedef enum {
-	ARV_VIEWER_MODE_CAMERA_LIST,
-	ARV_VIEWER_MODE_VIDEO
-} ArvViewerMode;
-
-static void 	select_mode 	(ArvViewer *viewer, ArvViewerMode mode);
+static void 	update_header_bar 	(ArvViewer *viewer);
+static void 	update_video_mode_button (ArvViewer *viewer);
+static void 	stop_camera 		(ArvViewer *viewer);
+static gpointer	feature_change_begin_cb	(gpointer user_data);
+static void	feature_change_end_cb	(gpointer user_data, gpointer state);
 
 void
 arv_viewer_set_options (ArvViewer *viewer,
@@ -941,6 +943,15 @@ black_level_scale_cb (GtkRange *range, ArvViewer *viewer)
 	g_signal_handler_unblock (viewer->black_level_spin_button, viewer->black_level_spin_changed);
 }
 
+/* True while the user is interacting with a widget (it has keyboard focus).
+ * Automatic refreshes must not overwrite such a widget, otherwise the value
+ * being typed is replaced by the current camera value. */
+static gboolean
+widget_is_being_edited (GtkWidget *widget)
+{
+	return widget != NULL && gtk_widget_has_focus (widget);
+}
+
 static gboolean
 update_exposure_cb (void *data)
 {
@@ -951,6 +962,10 @@ update_exposure_cb (void *data)
 	exposure = arv_camera_get_exposure_time (viewer->camera, NULL);
 	scaled_exposure = viewer->exposure_time_representation == ARV_GC_REPRESENTATION_LOGARITHMIC ?
 		arv_viewer_value_to_log (exposure, viewer->exposure_min, viewer->exposure_max) : exposure;
+
+	if (widget_is_being_edited (viewer->exposure_spin_button) ||
+	    widget_is_being_edited (viewer->exposure_hscale))
+		return TRUE;
 
 	g_signal_handler_block (viewer->exposure_hscale, viewer->exposure_hscale_changed);
 	g_signal_handler_block (viewer->exposure_spin_button, viewer->exposure_spin_changed);
@@ -998,6 +1013,10 @@ update_gain_cb (void *data)
 	scaled_gain = viewer->gain_representation == ARV_GC_REPRESENTATION_LOGARITHMIC ?
 		arv_viewer_value_to_log (gain, viewer->gain_min, viewer->gain_max) : gain;
 
+	if (widget_is_being_edited (viewer->gain_spin_button) ||
+	    widget_is_being_edited (viewer->gain_hscale))
+		return TRUE;
+
 	g_signal_handler_block (viewer->gain_hscale, viewer->gain_hscale_changed);
 	g_signal_handler_block (viewer->gain_spin_button, viewer->gain_spin_changed);
 	gtk_range_set_value (GTK_RANGE (viewer->gain_hscale), scaled_gain);
@@ -1043,6 +1062,10 @@ update_black_level_cb (void *data)
 	double black_level;
 
 	black_level = arv_camera_get_black_level (viewer->camera, NULL);
+
+	if (widget_is_being_edited (viewer->black_level_spin_button) ||
+	    widget_is_being_edited (viewer->black_level_hscale))
+		return TRUE;
 
 	g_signal_handler_block (viewer->black_level_hscale, viewer->black_level_hscale_changed);
 	g_signal_handler_block (viewer->black_level_spin_button, viewer->black_level_spin_changed);
@@ -1129,8 +1152,10 @@ set_camera_widgets(ArvViewer *viewer)
 	is_frame_rate_available = arv_camera_is_frame_rate_available (viewer->camera, NULL);
 	gtk_widget_set_sensitive (viewer->frame_rate_entry, is_frame_rate_available);
 
-	string = g_strdup_printf ("%g", arv_camera_get_frame_rate (viewer->camera, NULL));
-	gtk_entry_set_text (GTK_ENTRY (viewer->frame_rate_entry), string);
+	if (!widget_is_being_edited (viewer->frame_rate_entry)) {
+		string = g_strdup_printf ("%g", arv_camera_get_frame_rate (viewer->camera, NULL));
+		gtk_entry_set_text (GTK_ENTRY (viewer->frame_rate_entry), string);
+	}
 
 	is_gain_available = arv_camera_is_gain_available (viewer->camera, NULL);
 	if (is_gain_available) {
@@ -1489,54 +1514,60 @@ update_camera_region (ArvViewer *viewer)
 	arv_camera_get_region (viewer->camera, &x, &y, &width, &height, NULL);
 	arv_camera_get_binning (viewer->camera, &dx, &dy, NULL);
 
-        if (gtk_widget_get_visible(viewer->camera_binning_x)) {
-                arv_camera_get_x_binning_bounds (viewer->camera, &min, &max, NULL);
-                inc = arv_camera_get_x_binning_increment (viewer->camera, NULL);
-                gtk_spin_button_set_range (GTK_SPIN_BUTTON (viewer->camera_binning_x), min, max);
-                gtk_spin_button_set_increments (GTK_SPIN_BUTTON (viewer->camera_binning_x), inc, inc * 10);
-                gtk_spin_button_set_snap_to_ticks (GTK_SPIN_BUTTON (viewer->camera_binning_x), TRUE);
-                gtk_spin_button_set_value (GTK_SPIN_BUTTON (viewer->camera_binning_x), dx);
-        }
-        if (gtk_widget_get_visible(viewer->camera_binning_y)) {
-                arv_camera_get_y_binning_bounds (viewer->camera, &min, &max, NULL);
-                inc = arv_camera_get_y_binning_increment (viewer->camera,  NULL);
-                gtk_spin_button_set_range (GTK_SPIN_BUTTON (viewer->camera_binning_y), min, max);
-                gtk_spin_button_set_increments (GTK_SPIN_BUTTON (viewer->camera_binning_y), inc, inc * 10);
-                gtk_spin_button_set_snap_to_ticks (GTK_SPIN_BUTTON (viewer->camera_binning_y), TRUE);
-                gtk_spin_button_set_value (GTK_SPIN_BUTTON (viewer->camera_binning_y), dy);
-        }
-        if (gtk_widget_get_visible(viewer->camera_x)) {
-                arv_camera_get_x_offset_bounds (viewer->camera, &min, &max, NULL);
-                inc = arv_camera_get_x_offset_increment (viewer->camera, NULL);
-                gtk_spin_button_set_range (GTK_SPIN_BUTTON (viewer->camera_x), min, max);
-                gtk_spin_button_set_increments (GTK_SPIN_BUTTON (viewer->camera_x), inc, inc * 10);
-                gtk_spin_button_set_snap_to_ticks (GTK_SPIN_BUTTON (viewer->camera_x), TRUE);
-                gtk_spin_button_set_value (GTK_SPIN_BUTTON (viewer->camera_x), x);
-        }
-        if (gtk_widget_get_visible(viewer->camera_y)) {
-                arv_camera_get_y_offset_bounds (viewer->camera, &min, &max, NULL);
-                inc = arv_camera_get_y_offset_increment (viewer->camera, NULL);
-                gtk_spin_button_set_range (GTK_SPIN_BUTTON (viewer->camera_y), min, max);
-                gtk_spin_button_set_increments (GTK_SPIN_BUTTON (viewer->camera_y), inc, inc * 10);
-                gtk_spin_button_set_snap_to_ticks (GTK_SPIN_BUTTON (viewer->camera_y), TRUE);
-                gtk_spin_button_set_value (GTK_SPIN_BUTTON (viewer->camera_y), y);
-        }
-        if (gtk_widget_get_visible(viewer->camera_width)) {
-                arv_camera_get_width_bounds (viewer->camera, &min, &max, NULL);
-                inc = arv_camera_get_width_increment (viewer->camera, NULL);
-                gtk_spin_button_set_range (GTK_SPIN_BUTTON (viewer->camera_width), min, max);
-                gtk_spin_button_set_increments (GTK_SPIN_BUTTON (viewer->camera_width), inc, inc * 10);
-                gtk_spin_button_set_snap_to_ticks (GTK_SPIN_BUTTON (viewer->camera_width), TRUE);
-                gtk_spin_button_set_value (GTK_SPIN_BUTTON (viewer->camera_width), width);
-        }
-        if (gtk_widget_get_visible(viewer->camera_height)) {
-                arv_camera_get_height_bounds (viewer->camera, &min, &max, NULL);
-                inc = arv_camera_get_height_increment (viewer->camera, NULL);
-                gtk_spin_button_set_range (GTK_SPIN_BUTTON (viewer->camera_height), min, max);
-                gtk_spin_button_set_increments (GTK_SPIN_BUTTON (viewer->camera_height), inc, inc * 10);
-                gtk_spin_button_set_snap_to_ticks (GTK_SPIN_BUTTON (viewer->camera_height), TRUE);
-                gtk_spin_button_set_value (GTK_SPIN_BUTTON (viewer->camera_height), height);
-        }
+	if (gtk_widget_get_visible (viewer->camera_binning_x)) {
+		arv_camera_get_x_binning_bounds (viewer->camera, &min, &max, NULL);
+		inc = arv_camera_get_x_binning_increment (viewer->camera, NULL);
+		gtk_spin_button_set_range (GTK_SPIN_BUTTON (viewer->camera_binning_x), min, max);
+		gtk_spin_button_set_increments (GTK_SPIN_BUTTON (viewer->camera_binning_x), inc, inc * 10);
+		gtk_spin_button_set_snap_to_ticks (GTK_SPIN_BUTTON (viewer->camera_binning_x), TRUE);
+		if (!widget_is_being_edited (viewer->camera_binning_x))
+			gtk_spin_button_set_value (GTK_SPIN_BUTTON (viewer->camera_binning_x), dx);
+	}
+	if (gtk_widget_get_visible (viewer->camera_binning_y)) {
+		arv_camera_get_y_binning_bounds (viewer->camera, &min, &max, NULL);
+		inc = arv_camera_get_y_binning_increment (viewer->camera, NULL);
+		gtk_spin_button_set_range (GTK_SPIN_BUTTON (viewer->camera_binning_y), min, max);
+		gtk_spin_button_set_increments (GTK_SPIN_BUTTON (viewer->camera_binning_y), inc, inc * 10);
+		gtk_spin_button_set_snap_to_ticks (GTK_SPIN_BUTTON (viewer->camera_binning_y), TRUE);
+		if (!widget_is_being_edited (viewer->camera_binning_y))
+			gtk_spin_button_set_value (GTK_SPIN_BUTTON (viewer->camera_binning_y), dy);
+	}
+	if (gtk_widget_get_visible (viewer->camera_x)) {
+		arv_camera_get_x_offset_bounds (viewer->camera, &min, &max, NULL);
+		inc = arv_camera_get_x_offset_increment (viewer->camera, NULL);
+		gtk_spin_button_set_range (GTK_SPIN_BUTTON (viewer->camera_x), min, max);
+		gtk_spin_button_set_increments (GTK_SPIN_BUTTON (viewer->camera_x), inc, inc * 10);
+		gtk_spin_button_set_snap_to_ticks (GTK_SPIN_BUTTON (viewer->camera_x), TRUE);
+		if (!widget_is_being_edited (viewer->camera_x))
+			gtk_spin_button_set_value (GTK_SPIN_BUTTON (viewer->camera_x), x);
+	}
+	if (gtk_widget_get_visible (viewer->camera_y)) {
+		arv_camera_get_y_offset_bounds (viewer->camera, &min, &max, NULL);
+		inc = arv_camera_get_y_offset_increment (viewer->camera, NULL);
+		gtk_spin_button_set_range (GTK_SPIN_BUTTON (viewer->camera_y), min, max);
+		gtk_spin_button_set_increments (GTK_SPIN_BUTTON (viewer->camera_y), inc, inc * 10);
+		gtk_spin_button_set_snap_to_ticks (GTK_SPIN_BUTTON (viewer->camera_y), TRUE);
+		if (!widget_is_being_edited (viewer->camera_y))
+			gtk_spin_button_set_value (GTK_SPIN_BUTTON (viewer->camera_y), y);
+	}
+	if (gtk_widget_get_visible (viewer->camera_width)) {
+		arv_camera_get_width_bounds (viewer->camera, &min, &max, NULL);
+		inc = arv_camera_get_width_increment (viewer->camera, NULL);
+		gtk_spin_button_set_range (GTK_SPIN_BUTTON (viewer->camera_width), min, max);
+		gtk_spin_button_set_increments (GTK_SPIN_BUTTON (viewer->camera_width), inc, inc * 10);
+		gtk_spin_button_set_snap_to_ticks (GTK_SPIN_BUTTON (viewer->camera_width), TRUE);
+		if (!widget_is_being_edited (viewer->camera_width))
+			gtk_spin_button_set_value (GTK_SPIN_BUTTON (viewer->camera_width), width);
+	}
+	if (gtk_widget_get_visible (viewer->camera_height)) {
+		arv_camera_get_height_bounds (viewer->camera, &min, &max, NULL);
+		inc = arv_camera_get_height_increment (viewer->camera, NULL);
+		gtk_spin_button_set_range (GTK_SPIN_BUTTON (viewer->camera_height), min, max);
+		gtk_spin_button_set_increments (GTK_SPIN_BUTTON (viewer->camera_height), inc, inc * 10);
+		gtk_spin_button_set_snap_to_ticks (GTK_SPIN_BUTTON (viewer->camera_height), TRUE);
+		if (!widget_is_being_edited (viewer->camera_height))
+			gtk_spin_button_set_value (GTK_SPIN_BUTTON (viewer->camera_height), height);
+	}
 
 	g_signal_handler_unblock (viewer->camera_x, viewer->camera_x_changed);
 	g_signal_handler_unblock (viewer->camera_y, viewer->camera_y_changed);
@@ -1555,8 +1586,8 @@ update_pixel_format (ArvViewer *viewer)
 	const char *pixel_format_string;
 	const char **pixel_format_strings;
 	guint i, n_pixel_formats, n_pixel_format_strings, n_valid_formats;
-        gboolean bayer_tooltip = FALSE;
-        gint current_format = -1;
+	gboolean bayer_tooltip = FALSE;
+	gint current_format = -1;
 
 	g_signal_handler_block (viewer->pixel_format_combo, viewer->pixel_format_changed);
 
@@ -1569,39 +1600,39 @@ update_pixel_format (ArvViewer *viewer)
 	pixel_format_string = arv_camera_get_pixel_format_as_string (viewer->camera, NULL);
 	for (i = 0; i < n_pixel_formats; i++) {
 		const char *caps_string = arv_pixel_format_to_gst_caps_string (pixel_formats[i]);
-                gboolean valid = FALSE;
+		gboolean valid = FALSE;
 
-                gtk_list_store_append (list_store, &iter);
+		gtk_list_store_append (list_store, &iter);
 
-                if (caps_string != NULL && g_str_has_prefix (caps_string, "video/x-bayer") && !has_bayer2rgb) {
-                        bayer_tooltip = TRUE;
-                } else if (caps_string != NULL) {
+		if (caps_string != NULL && g_str_has_prefix (caps_string, "video/x-bayer") && !has_bayer2rgb) {
+			bayer_tooltip = TRUE;
+		} else if (caps_string != NULL) {
 			if (current_format < 0 ||
-                            g_strcmp0 (pixel_format_strings[i], pixel_format_string) == 0)
-                                current_format = i;
+			    g_strcmp0 (pixel_format_strings[i], pixel_format_string) == 0)
+				current_format = i;
 			n_valid_formats++;
-                        valid = TRUE;
+			valid = TRUE;
 		}
 
-                gtk_list_store_set (list_store, &iter,
-                                    0, pixel_format_strings[i],
-                                    1, valid,
-                                    -1);
+		gtk_list_store_set (list_store, &iter,
+				    0, pixel_format_strings[i],
+				    1, valid,
+				    -1);
 	}
 	g_free (pixel_formats);
 	g_free (pixel_format_strings);
 	gtk_widget_set_sensitive (viewer->pixel_format_combo, n_valid_formats > 0);
 	gtk_widget_set_sensitive (viewer->video_mode_button,
-                                  n_valid_formats > 0 &&
-                                  gtk_toggle_button_get_active (GTK_TOGGLE_BUTTON(viewer->component_check)));
+				  n_valid_formats > 0 &&
+				  gtk_toggle_button_get_active (GTK_TOGGLE_BUTTON (viewer->component_check)));
 
 	gtk_combo_box_set_active (GTK_COMBO_BOX (viewer->pixel_format_combo), current_format >= 0 ? current_format : 0);
 
-        gtk_widget_set_tooltip_text (GTK_WIDGET (viewer->pixel_format_combo),
-                                     bayer_tooltip ?
-                                     "Found bayer pixel formats, but the GStreamer bayer plugin "
-                                     "is not installed." :
-                                     NULL);
+	gtk_widget_set_tooltip_text (GTK_WIDGET (viewer->pixel_format_combo),
+				     bayer_tooltip ?
+				     "Found bayer pixel formats, but the GStreamer bayer plugin "
+				     "is not installed." :
+				     NULL);
 
 	g_signal_handler_unblock (viewer->pixel_format_combo, viewer->pixel_format_changed);
 }
@@ -1613,8 +1644,12 @@ camera_region_cb (GtkSpinButton *spin_button, ArvViewer *viewer)
 	int y = gtk_spin_button_get_value (GTK_SPIN_BUTTON (viewer->camera_y));
 	int width = gtk_spin_button_get_value (GTK_SPIN_BUTTON (viewer->camera_width));
 	int height = gtk_spin_button_get_value (GTK_SPIN_BUTTON (viewer->camera_height));
+	gpointer state;
 
+	(void) spin_button;
+	state = feature_change_begin_cb (viewer);
 	arv_camera_set_region (viewer->camera, x, y, width, height, NULL);
+	feature_change_end_cb (viewer, state);
 
 	update_camera_region (viewer);
 }
@@ -1624,8 +1659,12 @@ camera_binning_cb (GtkSpinButton *spin_button, ArvViewer *viewer)
 {
 	int dx = gtk_spin_button_get_value (GTK_SPIN_BUTTON (viewer->camera_binning_x));
 	int dy = gtk_spin_button_get_value (GTK_SPIN_BUTTON (viewer->camera_binning_y));
+	gpointer state;
 
+	(void) spin_button;
+	state = feature_change_begin_cb (viewer);
 	arv_camera_set_binning (viewer->camera, dx, dy, NULL);
+	feature_change_end_cb (viewer, state);
 
 	update_camera_region (viewer);
 }
@@ -1634,48 +1673,73 @@ static void
 component_combo_cb (GtkComboBoxText *combo, ArvViewer *viewer)
 {
 	char *component;
-        gboolean enabled;
+	gboolean enabled;
+	gpointer state;
 
 	component = gtk_combo_box_text_get_active_text (combo);
-        enabled = arv_camera_select_component (viewer->camera, component, ARV_COMPONENT_SELECTION_FLAGS_NONE, NULL,
-                                               NULL);
-        g_free (component);
+	state = feature_change_begin_cb (viewer);
+	enabled = arv_camera_select_component (viewer->camera, component, ARV_COMPONENT_SELECTION_FLAGS_NONE, NULL,
+					       NULL);
+	feature_change_end_cb (viewer, state);
+	g_free (component);
 
 	g_signal_handler_block (viewer->component_check, viewer->component_toggled);
-        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(viewer->component_check), enabled);
+	gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (viewer->component_check), enabled);
 	g_signal_handler_unblock (viewer->component_check, viewer->component_toggled);
 
 	update_camera_region (viewer);
-        update_pixel_format(viewer);
+	update_pixel_format (viewer);
 }
 
 static void
 component_toggled_cb (GtkToggleButton *button, ArvViewer *viewer)
 {
-        char *component;
-        gboolean enable;
+	char *component;
+	gboolean enable;
+	gpointer state;
 
-        component = gtk_combo_box_text_get_active_text (GTK_COMBO_BOX_TEXT(viewer->component_combo));
-        enable = gtk_toggle_button_get_active(button);
+	component = gtk_combo_box_text_get_active_text (GTK_COMBO_BOX_TEXT (viewer->component_combo));
+	enable = gtk_toggle_button_get_active (button);
 
 	gtk_widget_set_sensitive (viewer->video_mode_button, enable);
 
-        arv_camera_select_component(viewer->camera, component,
-                                    enable ? ARV_COMPONENT_SELECTION_FLAGS_ENABLE :
-                                    ARV_COMPONENT_SELECTION_FLAGS_DISABLE,
-                                    NULL, NULL);
+	state = feature_change_begin_cb (viewer);
+	arv_camera_select_component (viewer->camera, component,
+				     enable ? ARV_COMPONENT_SELECTION_FLAGS_ENABLE :
+				     ARV_COMPONENT_SELECTION_FLAGS_DISABLE,
+				     NULL, NULL);
+	feature_change_end_cb (viewer, state);
 
-        g_free (component);
+	g_free (component);
 }
 
 static void
 pixel_format_combo_cb (GtkComboBoxText *combo, ArvViewer *viewer)
 {
 	char *pixel_format;
+	gpointer state;
 
 	pixel_format = gtk_combo_box_text_get_active_text (combo);
+	state = feature_change_begin_cb (viewer);
 	arv_camera_set_pixel_format_from_string (viewer->camera, pixel_format, NULL);
+	feature_change_end_cb (viewer, state);
 	g_free (pixel_format);
+}
+
+static void
+set_sensitive (GtkCellLayout *cell_layout,
+	       GtkCellRenderer *cell,
+	       GtkTreeModel *tree_model,
+	       GtkTreeIter *iter,
+	       gpointer data)
+{
+	gboolean valid;
+
+	(void) cell_layout;
+	(void) data;
+	gtk_tree_model_get (tree_model, iter, 1, &valid, -1);
+
+	g_object_set (cell, "sensitive", valid, NULL);
 }
 
 static void
@@ -1687,8 +1751,6 @@ update_device_list_cb (GtkToolButton *button, ArvViewer *viewer)
 	unsigned int i;
 
 	gtk_widget_set_sensitive (viewer->video_mode_button, FALSE);
-	gtk_revealer_set_reveal_child (GTK_REVEALER(viewer->camera_parameters), FALSE);
-	gtk_widget_set_sensitive (viewer->camera_parameters, FALSE);
 
 	g_signal_handler_block (gtk_tree_view_get_selection (GTK_TREE_VIEW (viewer->camera_tree)), viewer->camera_selected);
 	list_store = GTK_LIST_STORE (gtk_tree_view_get_model (GTK_TREE_VIEW (viewer->camera_tree)));
@@ -1782,19 +1844,19 @@ start_video (ArvViewer *viewer)
 	ArvPixelFormat pixel_format;
 	gint width, height;
 	const char *caps_string;
-        char *component;
+	char *component;
 
 	if (!ARV_IS_CAMERA (viewer->camera))
 		return FALSE;
 
 	stop_video (viewer);
 
-        component = gtk_combo_box_text_get_active_text (GTK_COMBO_BOX_TEXT(viewer->component_combo));
-        if (component != NULL) {
-                arv_camera_select_component (viewer->camera, component, ARV_COMPONENT_SELECTION_FLAGS_NONE,
-                                             &viewer->component_id, NULL);
-                g_free (component);
-        }
+	component = gtk_combo_box_text_get_active_text (GTK_COMBO_BOX_TEXT (viewer->component_combo));
+	if (component != NULL) {
+		arv_camera_select_component (viewer->camera, component, ARV_COMPONENT_SELECTION_FLAGS_NONE,
+					     &viewer->component_id, NULL);
+		g_free (component);
+	}
 
 	viewer->rotation = 0;
 	viewer->stream = arv_camera_create_stream (viewer->camera, stream_cb, NULL, NULL, NULL);
@@ -1904,7 +1966,7 @@ select_camera_list_mode (gpointer user_data)
 {
 	ArvViewer *viewer = user_data;
 
-	select_mode (viewer, ARV_VIEWER_MODE_CAMERA_LIST);
+	stop_camera (viewer);
 	update_device_list_cb (GTK_TOOL_BUTTON (viewer->refresh_button), viewer);
 
 	return FALSE;
@@ -1916,29 +1978,86 @@ control_lost_cb (ArvCamera *camera, ArvViewer *viewer)
 	g_main_context_invoke (NULL, select_camera_list_mode, viewer);
 }
 
+/* Refresh the basic features tab widgets. This is registered as the feature
+ * tree's refresh callback, so it must not call back into the feature tree
+ * (the tree refreshes its own rows before invoking this). */
 static void
-stop_camera (ArvViewer *viewer)
+refresh_camera_controls (ArvViewer *viewer)
 {
-        gtk_revealer_set_reveal_child (GTK_REVEALER(viewer->camera_parameters), FALSE);
-	gtk_widget_set_sensitive (viewer->camera_parameters, FALSE);
-	gtk_widget_set_sensitive (viewer->video_mode_button, FALSE);
-	stop_video (viewer);
-	g_clear_object (&viewer->camera);
-	g_clear_pointer (&viewer->camera_name, g_free);
+	if (!ARV_IS_CAMERA (viewer->camera))
+		return;
+
+	set_camera_widgets (viewer);
+	update_camera_region (viewer);
+	update_pixel_format (viewer);
+}
+
+static gboolean
+feature_refresh_timeout_cb (gpointer user_data)
+{
+	ArvViewer *viewer = user_data;
+
+	refresh_camera_controls (viewer);
+
+	return TRUE;
+}
+
+/* Called by the feature tree before it writes a feature. Some features cannot
+ * be changed while acquisition is running, so stop it and remember whether it
+ * was running. Returns NULL when nested inside an outer change (the outer call
+ * owns the stop/restart), otherwise a token describing the previous state. */
+static gpointer
+feature_change_begin_cb (gpointer user_data)
+{
+	ArvViewer *viewer = user_data;
+	gboolean was_running;
+
+	if (viewer->feature_change_active)
+		return NULL;
+
+	was_running = GST_IS_PIPELINE (viewer->pipeline);
+	viewer->feature_change_active = TRUE;
+
+	if (was_running)
+		stop_video (viewer);
+
+	return GINT_TO_POINTER (was_running ? 2 : 1);
 }
 
 static void
-set_sensitive (GtkCellLayout *cell_layout,
-               GtkCellRenderer *cell,
-               GtkTreeModel *tree_model,
-               GtkTreeIter *iter,
-               gpointer data)
+feature_change_end_cb (gpointer user_data, gpointer state)
 {
-        gboolean valid;
+	ArvViewer *viewer = user_data;
+	gboolean was_running;
 
-        gtk_tree_model_get (tree_model, iter, 1, &valid, -1);
+	/* Nested change: the outer call owns the restart. */
+	if (state == NULL)
+		return;
 
-        g_object_set(cell, "sensitive", valid, NULL);
+	was_running = GPOINTER_TO_INT (state) == 2;
+	viewer->feature_change_active = FALSE;
+
+	if (was_running && ARV_IS_CAMERA (viewer->camera))
+		start_video (viewer);
+
+	update_video_mode_button (viewer);
+	update_header_bar (viewer);
+}
+
+static void
+stop_camera (ArvViewer *viewer)
+{
+	if (viewer->feature_refresh_event > 0) {
+		g_source_remove (viewer->feature_refresh_event);
+		viewer->feature_refresh_event = 0;
+	}
+	gtk_widget_set_sensitive (viewer->video_mode_button, FALSE);
+	arv_viewer_feature_tree_set_device (viewer->feature_tree, NULL);
+	stop_video (viewer);
+	g_clear_object (&viewer->camera);
+	g_clear_pointer (&viewer->camera_name, g_free);
+	update_video_mode_button (viewer);
+	update_header_bar (viewer);
 }
 
 static gboolean
@@ -1946,20 +2065,18 @@ start_camera (ArvViewer *viewer, const char *camera_id)
 {
 	GtkTreeIter iter;
 	GtkListStore *list_store;
-        const char **components;
-        guint n_components;
+	const char **components;
+	guint n_components;
 	gboolean binning_available;
-        gboolean region_offset_available;
-        unsigned int i;
+	gboolean region_offset_available;
+	unsigned int i;
 
 	stop_camera (viewer);
 
 	viewer->camera = arv_camera_new (camera_id, NULL);
 
-	if (!ARV_IS_CAMERA (viewer->camera)) {
-                gtk_revealer_set_reveal_child (GTK_REVEALER(viewer->camera_parameters), FALSE);
-                return FALSE;
-        }
+	if (!ARV_IS_CAMERA (viewer->camera))
+		return FALSE;
 
 	arv_device_set_register_cache_policy (arv_camera_get_device (viewer->camera),
 					      viewer->register_cache_policy);
@@ -1973,67 +2090,72 @@ start_camera (ArvViewer *viewer, const char *camera_id)
                 arv_camera_gv_set_multipart(viewer->camera, TRUE, NULL);
 
 	viewer->camera_name = g_strdup (camera_id);
-
-        gtk_widget_set_sensitive (viewer->camera_parameters, TRUE);
-	gtk_revealer_set_reveal_child (GTK_REVEALER(viewer->camera_parameters), TRUE);
+	arv_viewer_feature_tree_set_device (viewer->feature_tree, arv_camera_get_device (viewer->camera));
 
 	arv_camera_set_chunk_mode (viewer->camera, FALSE, NULL);
 
-        if (arv_camera_is_component_available(viewer->camera, NULL)) {
-                gint first_enabled_component = -1;
+	if (arv_camera_is_component_available (viewer->camera, NULL)) {
+		gint first_enabled_component = -1;
 
-                gtk_widget_set_visible(viewer->component_label, TRUE);
-                gtk_widget_set_visible(viewer->component_combo, TRUE);
-                gtk_widget_set_visible(viewer->component_check, TRUE);
+		gtk_widget_set_visible (viewer->component_label, TRUE);
+		gtk_widget_set_visible (viewer->component_combo, TRUE);
+		gtk_widget_set_visible (viewer->component_check, TRUE);
 
-                g_signal_handler_block (viewer->component_check, viewer->component_toggled);
-                g_signal_handler_block (viewer->component_combo, viewer->component_changed);
+		g_signal_handler_block (viewer->component_check, viewer->component_toggled);
+		g_signal_handler_block (viewer->component_combo, viewer->component_changed);
 
-                list_store = GTK_LIST_STORE (gtk_combo_box_get_model (GTK_COMBO_BOX (viewer->component_combo)));
-                gtk_list_store_clear (list_store);
-                components = arv_camera_dup_available_components (viewer->camera, &n_components, NULL);
-                for (i = 0; i < n_components; i++) {
-                        gtk_list_store_append (list_store, &iter);
-                        gtk_list_store_set (list_store, &iter,
-                                            0, components[i],
-                                            -1);
+		list_store = GTK_LIST_STORE (gtk_combo_box_get_model (GTK_COMBO_BOX (viewer->component_combo)));
+		gtk_list_store_clear (list_store);
+		components = arv_camera_dup_available_components (viewer->camera, &n_components, NULL);
+		for (i = 0; i < n_components; i++) {
+			gtk_list_store_append (list_store, &iter);
+			gtk_list_store_set (list_store, &iter,
+					    0, components[i],
+					    -1);
 
-                        if (first_enabled_component < 0 &&
-                            arv_camera_select_component(viewer->camera, components[i],
-                                                        ARV_COMPONENT_SELECTION_FLAGS_NONE, NULL, NULL))
-                                first_enabled_component = i;
-                }
-                g_free (components);
-                gtk_widget_set_sensitive (viewer->component_combo, n_components > 0);
-                gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(viewer->component_check), n_components > 0);
-                if (n_components > 0)
-                        gtk_combo_box_set_active (GTK_COMBO_BOX (viewer->component_combo), MAX(first_enabled_component, 0));
-                g_signal_handler_unblock (viewer->component_check, viewer->component_toggled);
-                g_signal_handler_unblock (viewer->component_combo, viewer->component_changed);
-        } else {
-                g_signal_handler_block (viewer->component_check, viewer->component_toggled);
-                gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(viewer->component_check), TRUE);
-                g_signal_handler_unblock (viewer->component_check, viewer->component_toggled);
-                gtk_widget_set_visible(viewer->component_label, FALSE);
-                gtk_widget_set_visible(viewer->component_combo, FALSE);
-                gtk_widget_set_visible(viewer->component_check, FALSE);
-        }
+			if (first_enabled_component < 0 &&
+			    arv_camera_select_component (viewer->camera, components[i],
+							 ARV_COMPONENT_SELECTION_FLAGS_NONE, NULL, NULL))
+				first_enabled_component = i;
+		}
+		g_free (components);
+		gtk_widget_set_sensitive (viewer->component_combo, n_components > 0);
+		gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (viewer->component_check), n_components > 0);
+		if (n_components > 0)
+			gtk_combo_box_set_active (GTK_COMBO_BOX (viewer->component_combo),
+						  MAX (first_enabled_component, 0));
+		g_signal_handler_unblock (viewer->component_check, viewer->component_toggled);
+		g_signal_handler_unblock (viewer->component_combo, viewer->component_changed);
+	} else {
+		g_signal_handler_block (viewer->component_check, viewer->component_toggled);
+		gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (viewer->component_check), TRUE);
+		g_signal_handler_unblock (viewer->component_check, viewer->component_toggled);
+		gtk_widget_set_visible (viewer->component_label, FALSE);
+		gtk_widget_set_visible (viewer->component_combo, FALSE);
+		gtk_widget_set_visible (viewer->component_check, FALSE);
+	}
 
-        region_offset_available = arv_camera_is_region_offset_available (viewer->camera, NULL);
+	region_offset_available = arv_camera_is_region_offset_available (viewer->camera, NULL);
 	gtk_widget_set_visible (viewer->camera_x, region_offset_available);
 	gtk_widget_set_visible (viewer->camera_y, region_offset_available);
-        gtk_widget_set_visible (viewer->camera_position_label, region_offset_available);
-        gtk_widget_set_visible (viewer->camera_position_units, region_offset_available);
+	gtk_widget_set_visible (viewer->camera_position_label, region_offset_available);
+	gtk_widget_set_visible (viewer->camera_position_units, region_offset_available);
 
 	binning_available = arv_camera_is_binning_available (viewer->camera, NULL);
 	gtk_widget_set_visible (viewer->camera_binning_x, binning_available);
 	gtk_widget_set_visible (viewer->camera_binning_y, binning_available);
-        gtk_widget_set_visible (viewer->camera_binning_label, binning_available);
-        gtk_widget_set_visible (viewer->camera_binning_units, binning_available);
+	gtk_widget_set_visible (viewer->camera_binning_label, binning_available);
+	gtk_widget_set_visible (viewer->camera_binning_units, binning_available);
 
-        update_pixel_format(viewer);
+	update_pixel_format (viewer);
 
 	update_camera_region (viewer);
+
+	update_video_mode_button (viewer);
+	update_header_bar (viewer);
+
+	if (viewer->feature_refresh_event == 0)
+		viewer->feature_refresh_event = g_timeout_add_seconds (2, feature_refresh_timeout_cb, viewer);
 
 	g_signal_connect (arv_camera_get_device (viewer->camera), "control-lost", G_CALLBACK (control_lost_cb), viewer);
 
@@ -2056,67 +2178,52 @@ camera_selection_changed_cb (GtkTreeSelection *selection, ArvViewer *viewer)
 }
 
 static void
-select_mode (ArvViewer *viewer, ArvViewerMode mode)
+update_header_bar (ArvViewer *viewer)
 {
-	gboolean video_visibility;
 	char *subtitle;
-	gint width, height, x, y;
 
-	if (!ARV_IS_CAMERA (viewer->camera))
-		mode = ARV_VIEWER_MODE_CAMERA_LIST;
+	if (ARV_IS_CAMERA (viewer->camera)) {
+		gint width, height, x, y;
 
-	switch (mode) {
-		case ARV_VIEWER_MODE_CAMERA_LIST:
-			video_visibility = FALSE;
-			gtk_stack_set_visible_child (GTK_STACK (viewer->main_stack), viewer->camera_box);
-			gtk_header_bar_set_title (GTK_HEADER_BAR (viewer->main_headerbar), "Aravis Viewer");
-			gtk_header_bar_set_subtitle (GTK_HEADER_BAR (viewer->main_headerbar), NULL);
-			stop_video (viewer);
-			break;
-		case ARV_VIEWER_MODE_VIDEO:
-                        g_signal_handler_block (viewer->flip_vertical_toggle, viewer->flip_vertical_clicked);
-                        g_signal_handler_block (viewer->flip_horizontal_toggle, viewer->flip_horizontal_clicked);
-                        gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON(viewer->flip_vertical_toggle), FALSE);
-                        gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON(viewer->flip_horizontal_toggle), FALSE);
-                        g_signal_handler_unblock (viewer->flip_vertical_toggle, viewer->flip_vertical_clicked);
-                        g_signal_handler_unblock (viewer->flip_horizontal_toggle, viewer->flip_horizontal_clicked);
-			video_visibility = TRUE;
-			arv_camera_get_region (viewer->camera, &x, &y, &width, &height, NULL);
-			subtitle = g_strdup_printf ("%s %dx%d@%d,%d %s",
-						    arv_camera_get_model_name (viewer->camera, NULL),
-						    width, height,
-						    x, y,
-						    arv_camera_get_pixel_format_as_string (viewer->camera, NULL));
-			gtk_stack_set_visible_child (GTK_STACK (viewer->main_stack), viewer->video_box);
-			gtk_header_bar_set_title (GTK_HEADER_BAR (viewer->main_headerbar), viewer->camera_name);
-			gtk_header_bar_set_subtitle (GTK_HEADER_BAR (viewer->main_headerbar), subtitle);
-			g_free (subtitle);
-			start_video (viewer);
-			break;
-		default:
-			g_assert_not_reached ();
-			break;
+		arv_camera_get_region (viewer->camera, &x, &y, &width, &height, NULL);
+		subtitle = g_strdup_printf ("%s %dx%d@%d,%d %s",
+					    arv_camera_get_model_name (viewer->camera, NULL),
+					    width, height,
+					    x, y,
+					    arv_camera_get_pixel_format_as_string (viewer->camera, NULL));
+		gtk_header_bar_set_title (GTK_HEADER_BAR (viewer->main_headerbar), viewer->camera_name);
+		gtk_header_bar_set_subtitle (GTK_HEADER_BAR (viewer->main_headerbar), subtitle);
+		g_free (subtitle);
+	} else {
+		gtk_header_bar_set_title (GTK_HEADER_BAR (viewer->main_headerbar), "Aravis Viewer");
+		gtk_header_bar_set_subtitle (GTK_HEADER_BAR (viewer->main_headerbar), NULL);
 	}
-
-	gtk_widget_set_visible (viewer->back_button, video_visibility);
-	gtk_widget_set_visible (viewer->rotate_cw_button, video_visibility);
-	gtk_widget_set_visible (viewer->flip_vertical_toggle, video_visibility);
-	gtk_widget_set_visible (viewer->flip_horizontal_toggle, video_visibility);
-	gtk_widget_set_visible (viewer->snapshot_button, video_visibility);
-	gtk_widget_set_visible (viewer->acquisition_button, video_visibility);
-
 }
 
 static void
-switch_to_camera_list_cb (GtkToolButton *button, ArvViewer *viewer)
+update_video_mode_button (ArvViewer *viewer)
 {
-	select_mode (viewer, ARV_VIEWER_MODE_CAMERA_LIST);
+	gboolean running = GST_IS_PIPELINE (viewer->pipeline);
+
+	gtk_tool_button_set_icon_name (GTK_TOOL_BUTTON (viewer->video_mode_button),
+				       running ? "media-playback-stop-symbolic" :
+				       "media-playback-start-symbolic");
+	gtk_widget_set_tooltip_text (viewer->video_mode_button,
+				     running ? "Stop video acquisition" : "Start video acquisition");
 }
 
 static void
 switch_to_video_mode_cb (GtkToolButton *button, ArvViewer *viewer)
 {
-	select_mode (viewer, ARV_VIEWER_MODE_VIDEO);
+	(void) button;
+
+	if (GST_IS_PIPELINE (viewer->pipeline))
+		stop_video (viewer);
+	else if (ARV_IS_CAMERA (viewer->camera))
+		start_video (viewer);
+
+	update_video_mode_button (viewer);
+	update_header_bar (viewer);
 }
 
 static void
@@ -2127,41 +2234,44 @@ arv_viewer_quit_cb (GtkApplicationWindow *window, ArvViewer *viewer)
 }
 
 static void
+set_up_camera_paned (ArvViewer *viewer, GtkBuilder *builder)
+{
+	/* The divider position is set from the UI file (camera_paned position). */
+	viewer->camera_paned = GTK_WIDGET (gtk_builder_get_object (builder, "camera_paned"));
+}
+
+static void
 activate (GApplication *application)
 {
 	ArvViewer *viewer = (ArvViewer *) application;
 	g_autoptr (GtkBuilder) builder = NULL;
-        g_autoptr (GtkListStore) list_store = NULL;
-        GtkCellRenderer *renderer;
 
 	builder = gtk_builder_new_from_resource ("/org/aravis/viewer/arv-viewer.ui");
 
 	viewer->main_window = GTK_WIDGET (gtk_builder_get_object (builder, "main_window"));
-	viewer->main_stack = GTK_WIDGET (gtk_builder_get_object (builder, "main_stack"));
+	viewer->main_paned = GTK_WIDGET (gtk_builder_get_object (builder, "main_paned"));
 	viewer->main_headerbar = GTK_WIDGET (gtk_builder_get_object (builder, "main_headerbar"));
 	viewer->camera_box = GTK_WIDGET (gtk_builder_get_object (builder, "camera_box"));
 	viewer->refresh_button = GTK_WIDGET (gtk_builder_get_object (builder, "refresh_button"));
 	viewer->video_mode_button = GTK_WIDGET (gtk_builder_get_object (builder, "video_mode_button"));
-	viewer->back_button = GTK_WIDGET (gtk_builder_get_object (builder, "back_button"));
 	viewer->snapshot_button = GTK_WIDGET (gtk_builder_get_object (builder, "snapshot_button"));
 	viewer->camera_tree = GTK_WIDGET (gtk_builder_get_object (builder, "camera_tree"));
-	viewer->camera_parameters = GTK_WIDGET (gtk_builder_get_object (builder, "camera_parameters"));
+	viewer->video_box = GTK_WIDGET (gtk_builder_get_object (builder, "video_box"));
+	viewer->video_frame = GTK_WIDGET (gtk_builder_get_object (builder, "video_frame"));
+	viewer->pixel_format_combo = GTK_WIDGET (gtk_builder_get_object (builder, "pixel_format_combo"));
 	viewer->component_label = GTK_WIDGET (gtk_builder_get_object (builder, "component_label"));
 	viewer->component_combo = GTK_WIDGET (gtk_builder_get_object (builder, "component_combo"));
 	viewer->component_check = GTK_WIDGET (gtk_builder_get_object (builder, "component_check"));
-	viewer->pixel_format_combo = GTK_WIDGET (gtk_builder_get_object (builder, "pixel_format_combo"));
 	viewer->camera_x = GTK_WIDGET (gtk_builder_get_object (builder, "camera_x"));
 	viewer->camera_y = GTK_WIDGET (gtk_builder_get_object (builder, "camera_y"));
-        viewer->camera_position_label = GTK_WIDGET(gtk_builder_get_object(builder, "camera_position_label"));
-        viewer->camera_position_units = GTK_WIDGET(gtk_builder_get_object(builder, "camera_position_units"));
-	viewer->camera_binning_x = GTK_WIDGET (gtk_builder_get_object (builder, "camera_binning_x"));
-	viewer->camera_binning_y = GTK_WIDGET (gtk_builder_get_object (builder, "camera_binning_y"));
-        viewer->camera_binning_label = GTK_WIDGET(gtk_builder_get_object(builder, "camera_binning_label"));
-        viewer->camera_binning_units = GTK_WIDGET(gtk_builder_get_object(builder, "camera_binning_units"));
 	viewer->camera_width = GTK_WIDGET (gtk_builder_get_object (builder, "camera_width"));
 	viewer->camera_height = GTK_WIDGET (gtk_builder_get_object (builder, "camera_height"));
-	viewer->video_box = GTK_WIDGET (gtk_builder_get_object (builder, "video_box"));
-	viewer->video_frame = GTK_WIDGET (gtk_builder_get_object (builder, "video_frame"));
+	viewer->camera_binning_x = GTK_WIDGET (gtk_builder_get_object (builder, "camera_binning_x"));
+	viewer->camera_binning_y = GTK_WIDGET (gtk_builder_get_object (builder, "camera_binning_y"));
+	viewer->camera_binning_label = GTK_WIDGET (gtk_builder_get_object (builder, "camera_binning_label"));
+	viewer->camera_binning_units = GTK_WIDGET (gtk_builder_get_object (builder, "camera_binning_units"));
+	viewer->camera_position_label = GTK_WIDGET (gtk_builder_get_object (builder, "camera_position_label"));
+	viewer->camera_position_units = GTK_WIDGET (gtk_builder_get_object (builder, "camera_position_units"));
 	viewer->fps_label = GTK_WIDGET (gtk_builder_get_object (builder, "fps_label"));
 	viewer->image_label = GTK_WIDGET (gtk_builder_get_object (builder, "image_label"));
 	viewer->trigger_combo_box = GTK_WIDGET (gtk_builder_get_object (builder, "trigger_combobox"));
@@ -2178,7 +2288,12 @@ activate (GApplication *application)
 	viewer->rotate_cw_button = GTK_WIDGET (gtk_builder_get_object (builder, "rotate_cw_button"));
 	viewer->flip_vertical_toggle = GTK_WIDGET (gtk_builder_get_object (builder, "flip_vertical_togglebutton"));
 	viewer->flip_horizontal_toggle = GTK_WIDGET (gtk_builder_get_object (builder, "flip_horizontal_togglebutton"));
-	viewer->acquisition_button = GTK_WIDGET (gtk_builder_get_object (builder, "acquisition_button"));
+	set_up_camera_paned (viewer, builder);
+	viewer->feature_tree = ARV_VIEWER_FEATURE_TREE (arv_viewer_feature_tree_new (builder));
+	arv_viewer_feature_tree_set_change_guard (viewer->feature_tree,
+						  feature_change_begin_cb, feature_change_end_cb, viewer);
+	arv_viewer_feature_tree_set_refresh_func (viewer->feature_tree,
+						  (ArvViewerFeatureTreeRefreshFunc) refresh_camera_controls, viewer);
 
         viewer->notification_revealer = GTK_WIDGET (gtk_builder_get_object (builder, "notification_revealer"));
         viewer->notification_label = GTK_WIDGET (gtk_builder_get_object (builder, "notification_label"));
@@ -2188,22 +2303,21 @@ activate (GApplication *application)
         g_signal_connect (viewer->notification_dismiss, "clicked",
                           G_CALLBACK (notification_dismiss_clicked_cb), viewer);
 
-        list_store = gtk_list_store_new(1, G_TYPE_STRING);
-        gtk_combo_box_set_model (GTK_COMBO_BOX (viewer->component_combo), GTK_TREE_MODEL (list_store));
+	{
+		GtkListStore *list_store;
+		GtkCellRenderer *renderer;
 
-        renderer = gtk_cell_renderer_text_new();
-        gtk_cell_layout_clear (GTK_CELL_LAYOUT (viewer->component_combo));
-        gtk_cell_layout_pack_start (GTK_CELL_LAYOUT (viewer->component_combo), renderer, TRUE);
-        gtk_cell_layout_set_attributes (GTK_CELL_LAYOUT (viewer->component_combo), renderer, "text", 0, NULL);
-
-        list_store = gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_BOOLEAN);
-        gtk_combo_box_set_model (GTK_COMBO_BOX (viewer->pixel_format_combo), GTK_TREE_MODEL (list_store));
-
-        renderer = gtk_cell_renderer_text_new();
-        gtk_cell_layout_clear (GTK_CELL_LAYOUT (viewer->pixel_format_combo));
-        gtk_cell_layout_pack_start (GTK_CELL_LAYOUT (viewer->pixel_format_combo), renderer, TRUE);
-        gtk_cell_layout_set_attributes (GTK_CELL_LAYOUT (viewer->pixel_format_combo), renderer, "text", 0, NULL);
-        gtk_cell_layout_set_cell_data_func (GTK_CELL_LAYOUT (viewer->pixel_format_combo), renderer, set_sensitive, NULL, NULL);
+		list_store = gtk_list_store_new (2, G_TYPE_STRING, G_TYPE_BOOLEAN);
+		gtk_combo_box_set_model (GTK_COMBO_BOX (viewer->pixel_format_combo),
+					 GTK_TREE_MODEL (list_store));
+		renderer = gtk_cell_renderer_text_new ();
+		gtk_cell_layout_clear (GTK_CELL_LAYOUT (viewer->pixel_format_combo));
+		gtk_cell_layout_pack_start (GTK_CELL_LAYOUT (viewer->pixel_format_combo), renderer, TRUE);
+		gtk_cell_layout_set_attributes (GTK_CELL_LAYOUT (viewer->pixel_format_combo), renderer,
+						"text", 0, NULL);
+		gtk_cell_layout_set_cell_data_func (GTK_CELL_LAYOUT (viewer->pixel_format_combo), renderer,
+						    set_sensitive, NULL, NULL);
+	}
 
 	gtk_widget_set_no_show_all (viewer->trigger_combo_box, TRUE);
 
@@ -2213,7 +2327,6 @@ activate (GApplication *application)
 
 	g_signal_connect (viewer->refresh_button, "clicked", G_CALLBACK (update_device_list_cb), viewer);
 	g_signal_connect (viewer->video_mode_button, "clicked", G_CALLBACK (switch_to_video_mode_cb), viewer);
-	g_signal_connect (viewer->back_button, "clicked", G_CALLBACK (switch_to_camera_list_cb), viewer);
 	g_signal_connect (viewer->main_window, "destroy", G_CALLBACK (arv_viewer_quit_cb), viewer);
 	g_signal_connect (viewer->snapshot_button, "clicked", G_CALLBACK (snapshot_cb), viewer);
 	viewer->rotate_cw_clicked = g_signal_connect (viewer->rotate_cw_button, "clicked",
@@ -2246,28 +2359,26 @@ activate (GApplication *application)
 	viewer->auto_black_level_clicked = g_signal_connect (viewer->auto_black_level_toggle, "clicked",
 						      G_CALLBACK (auto_black_level_cb), viewer);
 	viewer->component_changed = g_signal_connect (viewer->component_combo, "changed",
-							 G_CALLBACK (component_combo_cb), viewer);
-        viewer->component_toggled = g_signal_connect (viewer->component_check, "toggled",
-                                                      G_CALLBACK (component_toggled_cb), viewer);
-        viewer->pixel_format_changed = g_signal_connect (viewer->pixel_format_combo, "changed",
-                                                         G_CALLBACK (pixel_format_combo_cb), viewer);
-        viewer->camera_x_changed = g_signal_connect (viewer->camera_x, "value-changed",
-                                                     G_CALLBACK (camera_region_cb), viewer);
-        viewer->camera_y_changed = g_signal_connect (viewer->camera_y, "value-changed",
-                                                     G_CALLBACK (camera_region_cb), viewer);
-        viewer->camera_width_changed = g_signal_connect (viewer->camera_width, "value-changed",
-                                                         G_CALLBACK (camera_region_cb), viewer);
-        viewer->camera_height_changed = g_signal_connect (viewer->camera_height, "value-changed",
-                                                          G_CALLBACK (camera_region_cb), viewer);
-        viewer->camera_binning_x_changed = g_signal_connect (viewer->camera_binning_x, "value-changed",
-                                                             G_CALLBACK (camera_binning_cb), viewer);
-        viewer->camera_binning_y_changed = g_signal_connect (viewer->camera_binning_y, "value-changed",
-                                                             G_CALLBACK (camera_binning_cb), viewer);
+						      G_CALLBACK (component_combo_cb), viewer);
+	viewer->component_toggled = g_signal_connect (viewer->component_check, "toggled",
+						      G_CALLBACK (component_toggled_cb), viewer);
+	viewer->pixel_format_changed = g_signal_connect (viewer->pixel_format_combo, "changed",
+							 G_CALLBACK (pixel_format_combo_cb), viewer);
+	viewer->camera_x_changed = g_signal_connect (viewer->camera_x, "value-changed",
+						     G_CALLBACK (camera_region_cb), viewer);
+	viewer->camera_y_changed = g_signal_connect (viewer->camera_y, "value-changed",
+						     G_CALLBACK (camera_region_cb), viewer);
+	viewer->camera_width_changed = g_signal_connect (viewer->camera_width, "value-changed",
+							 G_CALLBACK (camera_region_cb), viewer);
+	viewer->camera_height_changed = g_signal_connect (viewer->camera_height, "value-changed",
+							  G_CALLBACK (camera_region_cb), viewer);
+	viewer->camera_binning_x_changed = g_signal_connect (viewer->camera_binning_x, "value-changed",
+							     G_CALLBACK (camera_binning_cb), viewer);
+	viewer->camera_binning_y_changed = g_signal_connect (viewer->camera_binning_y, "value-changed",
+							     G_CALLBACK (camera_binning_cb), viewer);
 
-	gtk_widget_set_sensitive (viewer->camera_parameters, FALSE);
-	gtk_revealer_set_reveal_child (GTK_REVEALER(viewer->camera_parameters), FALSE);
-
-	select_mode (viewer, ARV_VIEWER_MODE_CAMERA_LIST);
+	update_video_mode_button (viewer);
+	update_header_bar (viewer);
 	update_device_list_cb (GTK_TOOL_BUTTON (viewer->refresh_button), viewer);
 }
 

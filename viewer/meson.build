@@ -6,12 +6,14 @@ aravis_icon_dir = join_paths (get_option ('datadir'), 'icons', 'hicolor')
 
 viewer_sources = [
 	'main.c',
-	'arvviewer.c'
+	'arvviewer.c',
+	'arvfeaturetreewidgets.c'
 ]
 
 viewer_headers = [
 	'arvviewertypes.h',
-	'arvviewer.h'
+	'arvviewer.h',
+	'arvfeaturetree.h'
 ]
 
 viewer_c_args = [
