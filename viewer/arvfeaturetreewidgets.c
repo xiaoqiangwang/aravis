@@ -777,7 +777,7 @@ arv_viewer_feature_tree_set_device (ArvViewerFeatureTree *feature_tree, ArvDevic
 		return;
 	}
 
-	g_set_object (&feature_tree->genicam, device != NULL ? arv_device_get_genicam (device) : NULL);
+	g_set_object (&feature_tree->genicam, arv_device_get_genicam (device));
 	refresh_tree (feature_tree);
 	if (feature_tree->container != NULL)
 		gtk_widget_set_visible (feature_tree->container, TRUE);
